@@ -2,301 +2,223 @@ import jax
 import jax.numpy as jnp
 import flax.linen as nnx
 
+
 class SwiGLU(nnx.Module):
     """
     SwiGLU Gated Feed-Forward Network
     """
+
     hidden_dim: int
     output_dim: int
-    
+
     @nnx.compact
     def __call__(self, x):
         gate_projection = nnx.Dense(
-            self.hidden_dim,
-            use_bias=False,
-            name="gate_projection"
+            self.hidden_dim, use_bias=False, name="gate_projection"
         )
-        up_projection = nnx.Dense(
-            self.hidden_dim,
-            use_bias=False,
-            name="up_projection"
-        )
+        up_projection = nnx.Dense(self.hidden_dim, use_bias=False, name="up_projection")
         down_projection = nnx.Dense(
-            self.output_dim,
-            use_bias=False,
-            name="down_projection"
+            self.output_dim, use_bias=False, name="down_projection"
         )
-        
+
         gate = gate_projection(x)
         gate = nnx.silu(gate)
         up = up_projection(x)
         fused_gate = gate * up
         return down_projection(fused_gate)
-    
+
+
 class SparseMoE(nnx.Module):
     """
     Sparse Mixture of Experts Layer with Top_k Gating
     """
+
     num_experts: int
     experts_per_token: int
     embed_dim: int
     hidden_dim: int
-    
+
     @nnx.compact
     def __call__(self, x):
         batch_size, seq_len, _ = x.shape
         x_flat = x.reshape(-1, self.embed_dim)
-        
-        router = nnx.Dense(
-            self.num_experts,
-            use_bias=False,
-            name="router"
-        )
-        
+
+        router = nnx.Dense(self.num_experts, use_bias=False, name="router")
+
         experts = [
-            SwiGLU(
-                self.hidden_dim,
-                self.embed_dim,
-                name=f"expert_{i}"
-            )
+            SwiGLU(self.hidden_dim, self.embed_dim, name=f"expert_{i}")
             for i in range(self.num_experts)
         ]
-        
+
         router_logits = router(x_flat)
         top_k_logits, top_k_indices = jax.lax.top_k(
-            router_logits,
-            k=self.experts_per_token
+            router_logits, k=self.experts_per_token
         )
         top_k_weights = nnx.softmax(top_k_logits, axis=-1)
-        
+
         final_output = jnp.zeros_like(x_flat)
-        
+
         for i in range(self.num_experts):
             expert_mask = jnp.any(top_k_indices == i, axis=-1)
             expert_indices = jnp.where(expert_mask)[0]
-            
+
             if expert_indices.shape[0] == 0:
                 continue
-            
+
             expert_tokens = x_flat[expert_indices]
             expert_output = experts[i](expert_tokens)
-            
+
             k_indices = jnp.where(top_k_indices == i)
             weights_for_expert = top_k_weights[k_indices]
-            
+
             weighted_output = expert_output * jnp.expand_dims(
-                weights_for_expert,
-                axis=-1
+                weights_for_expert, axis=-1
             )
-            final_output = final_output \
-                .at[expert_indices] \
-                .add(weighted_output)
-            
+            final_output = final_output.at[expert_indices].add(weighted_output)
+
         return final_output.reshape((batch_size, seq_len, self.embed_dim))
-    
+
+
 class GQA(nnx.Module):
     """
     Standard Grouped-Query Attention
     """
+
     embed_dim: int
     num_heads: int
     num_kv_groups: int
     use_casual_mask: bool = False
-    
+
     @nnx.compact
     def __call__(self, query, key, value, mask=None):
         batch_size, seq_len_q, _ = query.shape
         seq_len_kv = key.shape[1]
-        
+
         key_dim = self.embed_dim // self.num_heads
         if self.num_heads % self.num_kv_groups != 0:
             raise ValueError("num_heads must be divisible by num_kv_groups")
 
         num_kv_heads = self.num_kv_groups
-        
-        query_proj = nnx.Dense(
-            self.embed_dim,
-            use_bias=False,
-            name="query_proj"
-        )
-        
-        key_proj = nnx.Dense(
-            key_dim * num_kv_heads,
-            use_bias=False,
-            name="key_proj"
-        )
-        
+
+        query_proj = nnx.Dense(self.embed_dim, use_bias=False, name="query_proj")
+
+        key_proj = nnx.Dense(key_dim * num_kv_heads, use_bias=False, name="key_proj")
+
         value_proj = nnx.Dense(
-            key_dim * num_kv_heads,
-            use_bias=False,
-            name="value_proj"
+            key_dim * num_kv_heads, use_bias=False, name="value_proj"
         )
-        
-        output_proj = nnx.Dense(
-            self.embed_dim,
-            use_bias=False,
-            name="output_proj"
-        )
-        
+
+        output_proj = nnx.Dense(self.embed_dim, use_bias=False, name="output_proj")
+
         scale = 1.0 / (float(key_dim) ** 0.5)
-        
+
         q = query_proj(query)
         k = key_proj(key)
         v = value_proj(value)
-        
-        q = q.reshape(
-            batch_size,
-            seq_len_q,
-            self.num_heads,
-            key_dim
-        ).transpose(0, 2, 1, 3)
-        
-        k = k.reshape(
-            batch_size,
-            seq_len_kv,
-            num_kv_heads,
-            key_dim
-        ).transpose(0, 2, 1, 3)
-        
-        v = v.reshape(
-            batch_size,
-            seq_len_kv,
-            num_kv_heads,
-            key_dim
-        ).transpose(0, 2, 1, 3)
-        
+
+        q = q.reshape(batch_size, seq_len_q, self.num_heads, key_dim).transpose(
+            0, 2, 1, 3
+        )
+
+        k = k.reshape(batch_size, seq_len_kv, num_kv_heads, key_dim).transpose(
+            0, 2, 1, 3
+        )
+
+        v = v.reshape(batch_size, seq_len_kv, num_kv_heads, key_dim).transpose(
+            0, 2, 1, 3
+        )
+
         n_rep = self.num_heads // num_kv_heads
         k_rep = jnp.repeat(k, n_rep, axis=1)
         v_rep = jnp.repeat(v, n_rep, axis=1)
-        
-        scores = jnp.matmul(
-            q,
-            k_rep.transpose(0, 1, 3, 2)
-        ) * scale
-        
+
+        scores = jnp.matmul(q, k_rep.transpose(0, 1, 3, 2)) * scale
+
         if mask is not None:
-            mask_expanded = jnp.expand_dims(
-                jnp.expand_dims(mask, 1),
-                1
-            )
+            mask_expanded = jnp.expand_dims(jnp.expand_dims(mask, 1), 1)
             scores = scores + (1.0 - mask_expanded.astype(scores.dtype)) * -1e9
-        
+
         if self.use_casual_mask:
             casual_mask = nnx.make_causal_mask(q, dtype=bool)
             scores = jnp.where(casual_mask, scores, -1e9)
-        
-        attention_weights = nnx.softmax(scores, axis=-1) # type: ignore
+
+        attention_weights = nnx.softmax(scores, axis=-1)  # type: ignore
         attention_output = jnp.matmul(attention_weights, v_rep)
-        
-        attention_output = attention_output \
-                            .transpose(0, 2, 1, 3) \
-                            .reshape(batch_size, seq_len_q, self.embed_dim)
+
+        attention_output = attention_output.transpose(0, 2, 1, 3).reshape(
+            batch_size, seq_len_q, self.embed_dim
+        )
         return output_proj(attention_output)
-    
+
+
 class TimeAwareGQA(nnx.Module):
     """
     Time-Aware Grouped-Query Attention
     """
+
     embed_dim: int
     num_heads: int
     num_kv_groups: int
-    
+
     @nnx.compact
     def __call__(self, query, key, value, session_deltas, mask=None):
-        batch_size, seq_len, _ = query.shape    
+        batch_size, seq_len, _ = query.shape
         key_dim = self.embed_dim // self.num_heads
-        
+
         if self.num_heads % self.num_kv_groups != 0:
             raise ValueError("num_heads must be divisible by num_kv_groups")
-        
+
         num_kv_heads = self.num_kv_groups
-        
-        query_proj = nnx.Dense(
-            self.embed_dim,
-            use_bias=False,
-            name="query_proj"
-        )
-        
-        key_proj = nnx.Dense(
-            key_dim * num_kv_heads,
-            use_bias=False,
-            name="key_proj"
-        )
-        
+
+        query_proj = nnx.Dense(self.embed_dim, use_bias=False, name="query_proj")
+
+        key_proj = nnx.Dense(key_dim * num_kv_heads, use_bias=False, name="key_proj")
+
         value_proj = nnx.Dense(
-            key_dim * num_kv_heads,
-            use_bias=False,
-            name="value_proj"
+            key_dim * num_kv_heads, use_bias=False, name="value_proj"
         )
-        
-        output_proj = nnx.Dense(
-            self.embed_dim,
-            use_bias=False,
-            name="output_proj"
-        )
-        
-        time_bias_weight = self.param(
-            'time_bias_weight',
-            nnx.initializers.zeros,
-            ()
-        )
-        
+
+        output_proj = nnx.Dense(self.embed_dim, use_bias=False, name="output_proj")
+
+        time_bias_weight = self.param("time_bias_weight", nnx.initializers.zeros, ())
+
         scale = 1.0 / (float(key_dim) ** 0.5)
-        
+
         q = query_proj(query)
         k = key_proj(key)
         v = value_proj(value)
-        
-        q = q.reshape(
-            batch_size,
-            seq_len,
-            self.num_heads,
-            key_dim
-        ).transpose(0, 2, 1, 3)
-        
-        k = k.reshape(
-            batch_size,
-            seq_len,
-            num_kv_heads,
-            key_dim
-        ).transpose(0, 2, 1, 3)
-        
-        v = v.reshape(
-            batch_size,
-            seq_len,
-            num_kv_heads,
-            key_dim
-        ).transpose(0, 2, 1, 3)
-        
+
+        q = q.reshape(batch_size, seq_len, self.num_heads, key_dim).transpose(
+            0, 2, 1, 3
+        )
+
+        k = k.reshape(batch_size, seq_len, num_kv_heads, key_dim).transpose(0, 2, 1, 3)
+
+        v = v.reshape(batch_size, seq_len, num_kv_heads, key_dim).transpose(0, 2, 1, 3)
+
         n_rep = self.num_heads // num_kv_heads
         k_rep = jnp.repeat(k, n_rep, axis=1)
         v_rep = jnp.repeat(v, n_rep, axis=1)
-        
-        scores = jnp.matmul(
-            q,
-            k_rep.transpose(0, 1, 3, 2)
-        ) * scale
-        
+
+        scores = jnp.matmul(q, k_rep.transpose(0, 1, 3, 2)) * scale
+
         cumulative_time = jnp.cumsum(session_deltas, axis=1)
         t_i = jnp.expand_dims(cumulative_time, 2)
         t_j = jnp.expand_dims(cumulative_time, 1)
         pairwise_delta = jnp.abs(t_i - t_j)
         log_delta = jnp.log(1.0 + pairwise_delta)
         time_bias = time_bias_weight * log_delta
-        
+
         scores = scores + jnp.expand_dims(time_bias, 1)
-        
+
         if mask is not None:
-            mask_expanded = jnp.expand_dims(
-                jnp.expand_dims(mask, 1),
-                1
-            )
+            mask_expanded = jnp.expand_dims(jnp.expand_dims(mask, 1), 1)
             scores = scores + (1.0 - mask_expanded.astype(scores.dtype)) * -1e9
-        
-        attention_weights = nnx.softmax(scores, axis=-1) # type: ignore
+
+        attention_weights = nnx.softmax(scores, axis=-1)  # type: ignore
         attention_output = jnp.matmul(attention_weights, v_rep)
-        
-        attention_output = attention_output \
-                            .transpose(0, 2, 1, 3) \
-                            .reshape(batch_size, seq_len, self.embed_dim)
+
+        attention_output = attention_output.transpose(0, 2, 1, 3).reshape(
+            batch_size, seq_len, self.embed_dim
+        )
         return output_proj(attention_output)
